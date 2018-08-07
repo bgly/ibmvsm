@@ -10,10 +10,10 @@
 #ifndef IBMVSM_H
 #define IBMVSM_H
 
-#define H_OPEN_VTERM_LP		0x3D4
-#define H_GET_TERM_CHAR_LP	0x3D8
-#define H_PUT_TERM_CHAR_LP	0x3DC
-#define H_CLOSE_VTERM_LP	0x3E0
+#define H_OPEN_VTERM_LP		0x408
+#define H_GET_TERM_CHAR_LP	0x40C
+#define H_PUT_TERM_CHAR_LP	0x410
+#define H_CLOSE_VTERM_LP	0x414
 
 #define VSM_MSG_VER_EXCH		0x01
 #define VSM_MSG_VTERM_INT		0x02
