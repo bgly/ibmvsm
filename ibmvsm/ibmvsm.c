@@ -14,7 +14,7 @@
 #include <linux/poll.h>
 #include <linux/init.h>
 #include <linux/io.h>
-#include <linux/miscdevice.h>
+#include <linux/device.h>
 
 #include <asm/hvcall.h>
 #include <asm/vio.h>
@@ -33,6 +33,10 @@ static const char ibmvsm_driver_name[] = "ibmvsm";
 static struct ibmvsm_struct ibmvsm;
 static struct ibmvsm_vterm vterms[MAX_VTERM];
 static struct crq_server_adapter ibmvsm_adapter;
+static dev_t ibmvsm_chrdev;
+
+static struct class *ibmvsm_class;
+struct device *ibmvsm_dev;
 
 enum crq_entry_header {
 	CRQ_FREE = 0x00,
@@ -729,12 +733,6 @@ static struct vio_driver ibmvsm_driver = {
 	.remove      = ibmvsm_remove,
 };
 
-static struct miscdevice ibmvsm_miscdev = {
-	.name = ibmvsm_driver_name,
-	.minor = MISC_DYNAMIC_MINOR,
-	.fops = &ibmvsm_fops,
-};
-
 static int __init ibmvsm_module_init(void)
 {
 	int rc, i;
@@ -742,18 +740,46 @@ static int __init ibmvsm_module_init(void)
 	ibmvsm.state = ibmvsm_state_initial;
 	pr_info("ibmvsm: version %s\n", IBMVSM_DRIVER_VERSION);
 
-	rc = misc_register(&ibmvsm_miscdev);
-	if (rc) {
-		pr_err("ibmvsm: misc registration failed\n");
-		goto misc_register_fail;
+	/* Dynamically allocate ibmvsm major number */
+	if (alloc_chrdev_region(&ibmvsm_chrdev, 0, VSM_NUM_MINORS,
+		ibmvsm_driver_name)) {
+		pr_err("ibmvsm: unable to allocate a dev_t\n");
+		rc = -EIO;
+		goto alloc_chrdev_failed;
 	}
-	pr_info("ibmvsm: node %d:%d\n", MISC_MAJOR,
-		ibmvsm_miscdev.minor);
+
+	pr_info("ibmvsm: node %d:%d\n", MAJOR(ibmvsm_chrdev),
+			MINOR(ibmvsm_chrdev));
 
 	memset(vterms, 0, sizeof(struct ibmvsm_vterm) * MAX_VTERM);
 	for (i = 0; i < MAX_VTERM; i++) {
 		spin_lock_init(&vterms[i].lock);
 		vterms[i].state = ibmvterm_state_free;
+	}
+
+	cdev_init(&ibmvsm.cdev, &ibmvsm_fops);
+	ibmvsm.cdev.owner = THIS_MODULE;
+	ibmvsm.cdev.ops = &ibmvsm_fops;
+
+	rc = cdev_add(&ibmvsm.cdev, ibmvsm_chrdev, VSM_NUM_MINORS);
+	if (rc) {
+		pr_err("ibmvsm: unable to add cdev: %d\n", rc);
+		goto cdev_add_failed;
+	}
+
+	ibmvsm_class = class_create(THIS_MODULE, "ibmvsm");
+	if (IS_ERR(ibmvsm_class)) {
+		rc = PTR_ERR(ibmvsm_class);
+		pr_err("ibmvsm: class regiter ibmvsm failed");
+		goto cdev_add_failed;
+	}
+
+	ibmvsm_dev = device_create(ibmvsm_class, NULL, ibmvsm_chrdev,
+			NULL, "ibmvsm");
+	if (IS_ERR(ibmvsm_dev)) {
+		rc = PTR_ERR(ibmvsm_dev);
+		pr_err("ibmvsm: device add failed");
+		goto device_create_failed;
 	}
 
 	rc = vio_register_driver(&ibmvsm_driver);
@@ -765,8 +791,12 @@ static int __init ibmvsm_module_init(void)
 	return 0;
 
 vio_reg_fail:
-	misc_deregister(&ibmvsm_miscdev);
-misc_register_fail:
+	cdev_del(&ibmvsm.cdev);
+device_create_failed:
+	class_destroy(ibmvsm_class);
+cdev_add_failed:
+	unregister_chrdev_region(ibmvsm_chrdev, VSM_NUM_MINORS);
+alloc_chrdev_failed:
 	return rc;
 }
 
@@ -774,7 +804,10 @@ static void __exit ibmvsm_module_exit(void)
 {
 	pr_info("ibmvsm: module exit\n");
 	vio_unregister_driver(&ibmvsm_driver);
-	misc_deregister(&ibmvsm_miscdev);
+	cdev_del(&ibmvsm.cdev);
+	device_destroy(ibmvsm_class, ibmvsm_chrdev);
+	class_destroy(ibmvsm_class);
+	unregister_chrdev_region(ibmvsm_chrdev, VSM_NUM_MINORS);
 }
 
 MODULE_AUTHOR("Bryant G. Ly <bryantly@linux.vnet.ibm.com>");

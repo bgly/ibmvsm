@@ -10,6 +10,8 @@
 #ifndef IBMVSM_H
 #define IBMVSM_H
 
+#include <linux/cdev.h>
+
 #define H_OPEN_VTERM_LP		0x408
 #define H_GET_TERM_CHAR_LP	0x40C
 #define H_PUT_TERM_CHAR_LP	0x410
@@ -24,6 +26,8 @@
 /* ioctl info */
 #define VSM_TYPE		0xCD
 #define VSM_IOCTL_SETID		_IOW(VSM_TYPE, 0x00, unsigned char *)
+
+#define VSM_NUM_MINORS 1
 
 enum ibmvsm_states {
 	ibmvsm_state_sched_reset  = -1,
@@ -79,6 +83,7 @@ struct crq_server_adapter {
 struct ibmvsm_struct {
 	u32 state;
 	struct crq_server_adapter *adapter;
+	struct cdev cdev;
 };
 
 struct ibmvmc_file_session;
