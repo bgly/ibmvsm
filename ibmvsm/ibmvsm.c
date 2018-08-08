@@ -573,7 +573,7 @@ static int ibmvsm_init_crq_queue(struct crq_server_adapter *adapter)
 	retrc = plpar_hcall_norets(H_REG_CRQ,
 				   vdev->unit_address,
 				   queue->msg_token, PAGE_SIZE);
-	retrc = rc;
+	rc = retrc;
 
 	if (rc == H_RESOURCE)
 		rc = ibmvsm_reset_crq_queue(adapter);
