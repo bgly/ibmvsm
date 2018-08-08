@@ -8,6 +8,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/interrupt.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
@@ -351,6 +352,33 @@ static irqreturn_t ibmvsm_handle_event(int irq, void *dev_instance)
 }
 
 /**
+ * ibmvsm_release_crq_queue - Release CRQ Queue
+ *
+ * @adapter:	crq_server_adapter struct
+ *
+ * Return:
+ *	0 - Success
+ *	Non-Zero - Failure
+ */
+static void ibmvsm_release_crq_queue(struct crq_server_adapter *adapter)
+{
+	struct vio_dev *vdev = to_vio_dev(adapter->dev);
+	struct crq_queue *queue = &adapter->queue;
+
+	free_irq(vdev->irq, (void *)adapter);
+	tasklet_kill(&adapter->work_task);
+
+	if (adapter->reset_task)
+		kthread_stop(adapter->reset_task);
+
+	h_free_crq(vdev->unit_address);
+	dma_unmap_single(adapter->dev,
+			 queue->msg_token,
+			 queue->size * sizeof(*queue->msgs), DMA_BIDIRECTIONAL);
+	free_page((unsigned long)queue->msgs);
+}
+
+/**
  * ibmvsm_reset_crq_queue - Reset CRQ Queue
  *
  * @adapter:	crq_server_adapter struct
@@ -427,6 +455,78 @@ static void ibmvsm_crq_process(struct crq_server_adapter *adapter,
  */
 static void ibmvsm_reset(struct crq_server_adapter *adapter, bool xport_event)
 {
+	if (ibmvsm.state != ibmvsm_state_sched_reset) {
+		dev_info(adapter->dev, "*** Reset to initial state.\n");
+
+		/* TODO: return the vterm used back to init state to re-use*/
+
+		if (xport_event) {
+			/* CRQ was closed by the partner.  We don't need to do
+			 * anything except set ourself to the correct state to
+			 * handle init msgs.
+			 */
+			ibmvsm.state = ibmvsm_state_crqinit;
+		} else {
+			/* The partner did not close their CRQ - instead, we're
+			 * closing the CRQ on our end. Need to schedule this
+			 * for process context, because CRQ reset may require a
+			 * sleep.
+			 *
+			 * Setting ibmvsm.state here immediately prevents
+			 * ibmvsm_open from completing until the reset
+			 * completes in process context.
+			 */
+			ibmvsm.state = ibmvsm_state_sched_reset;
+			dev_dbg(adapter->dev, "Device reset scheduled");
+			wake_up_interruptible(&adapter->reset_wait_queue);
+		}
+	}
+}
+
+/**
+ * ibmvsm_reset_task - Reset Task
+ *
+ * @data:	Data field
+ *
+ * Performs a CRQ reset of the VSM device in process context.
+ * NOTE: This function should not be called directly, use ibmvsm_reset.
+ */
+static int ibmvsm_reset_task(void *data)
+{
+	struct crq_server_adapter *adapter = data;
+	int rc;
+
+	set_user_nice(current, -20);
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(adapter->reset_wait_queue,
+			(ibmvsm.state == ibmvsm_state_sched_reset) ||
+			kthread_should_stop());
+
+		if (kthread_should_stop())
+			break;
+
+		dev_dbg(adapter->dev, "CRQ resetting in process context");
+		tasklet_disable(&adapter->work_task);
+
+		rc = ibmvsm_reset_crq_queue(adapter);
+
+		if (rc != H_SUCCESS && rc != H_RESOURCE) {
+			dev_err(adapter->dev, "Error initializing CRQ.  rc = 0x%x\n",
+				rc);
+			ibmvsm.state = ibmvsm_state_failed;
+		} else {
+			ibmvsm.state = ibmvsm_state_crqinit;
+
+			if (ibmvsm_send_init_msg(adapter, CRQ_INIT) != 0 &&
+			    rc != H_RESOURCE)
+				dev_warn(adapter->dev, "Failed to send initialize CRQ message\n");
+		}
+
+		vio_enable_interrupts(to_vio_dev(adapter->dev));
+		tasklet_enable(&adapter->work_task);
+	}
+
 	return 0;
 }
 
@@ -686,6 +786,16 @@ static int ibmvsm_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 	dev_dbg(adapter->dev, "Probe: liobn 0x%x, riobn 0x%x\n",
 		adapter->liobn, adapter->riobn);
 
+	init_waitqueue_head(&adapter->reset_wait_queue);
+	adapter->reset_task = kthread_run(ibmvsm_reset_task, adapter, "ibmvsm");
+	if (IS_ERR(adapter->reset_task)) {
+		dev_err(adapter->dev, "Failed to start reset thread\n");
+		ibmvsm.state = ibmvsm_state_failed;
+		rc = PTR_ERR(adapter->reset_task);
+		adapter->reset_task = NULL;
+		return rc;
+	}
+
 	/* Init CRQ */
 	rc = ibmvsm_init_crq_queue(adapter);
 	if (rc != 0 && rc != H_RESOURCE) {
@@ -705,6 +815,8 @@ static int ibmvsm_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 
 	return 0;
 crq_failed:
+	kthread_stop(adapter->reset_task);
+	adapter->reset_task = NULL;
 	return -EPERM;
 }
 
@@ -716,6 +828,7 @@ static int ibmvsm_remove(struct vio_dev *vdev)
 		 vdev->unit_address);
 
 	/* Need to release the CRQ here */
+	ibmvsm_release_crq_queue(adapter);
 
 	return 0;
 }

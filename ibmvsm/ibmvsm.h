@@ -78,6 +78,8 @@ struct crq_server_adapter {
 	u32 liobn;
 	u32 riobn;
 	struct tasklet_struct work_task;
+	wait_queue_head_t reset_wait_queue;
+	struct task_struct *reset_task;
 };
 
 struct ibmvsm_struct {
